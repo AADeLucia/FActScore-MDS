@@ -1,9 +1,10 @@
 import pickle
 import os
 import time
+from pathlib import Path
+
 
 class LM(object):
-
     def __init__(self, cache_file):
         self.cache_file = cache_file
         self.cache_dict = self.load_cache()
@@ -36,6 +37,9 @@ class LM(object):
     def save_cache(self):
         if self.add_n == 0:
             return
+        # Create cache directory
+        cache_dir = Path(self.cache_file).parent
+        os.makedirs(cache_dir, exist_ok=True)
 
         # load the latest cache first, since if there were other processes running in parallel, cache might have been updated
         for k, v in self.load_cache().items():

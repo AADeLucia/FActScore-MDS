@@ -7,32 +7,36 @@ import logging
 
 from tqdm import tqdm
 from factscore.abstain_detection import is_response_abstained
-from factscore.atomic_facts import AtomicFactGenerator
+from factscore.atomic_facts import AtomicFactGenerator, AtomicFactGeneratorGPT
 from factscore.clm import CLM
 from factscore.npm import NPM
 from factscore.openai_lm import OpenAIModel
-from factscore.retrieval import DocDB, Retrieval
+from factscore.retrieval import DocDB, DocDBMD, Retrieval, RetrievalMD
+
 
 class FactScorer(object):
-
     def __init__(self,
                  model_name="retrieval+ChatGPT",
                  data_dir=".cache/factscore",
                  model_dir=".cache/factscore",
                  cache_dir=".cache/factscore",
-                 openai_key="api.key",
+                 openai_key=None,
                  cost_estimate="consider_cache",
                  abstain_detection_type=None,
-                 batch_size=256):
+                 batch_size=256,
+                 mode="single"
+                 ):
         assert model_name in ["retrieval+llama", "retrieval+llama+npm", "retrieval+ChatGPT", "npm", "retrieval+ChatGPT+npm"]
+        assert mode in ["multi", "single"]
         self.model_name = model_name
 
         self.db = {}
         self.retrieval = {}
         self.npm = {}
-        self.batch_size = batch_size # batch size for retrieval
+        self.batch_size = batch_size  # batch size for retrieval
         self.openai_key = openai_key
         self.abstain_detection_type = abstain_detection_type
+        self.mode = mode
 
         self.data_dir = data_dir
         self.cache_dir = cache_dir
@@ -64,24 +68,35 @@ class FactScorer(object):
 
     def register_knowledge_source(self, name="enwiki-20230401", db_path=None, data_path=None):
         assert name not in self.retrieval, f"{name} already registered"
+        if self.mode == "multi":
+            suffix = "_multi"
+            retrieval_class = RetrievalMD
+            db_class = DocDBMD
+        else:
+            suffix = ""
+            retrieval_class = Retrieval
+            db_class = DocDB
+
         if db_path is None:
-            db_path = os.path.join(self.data_dir, f"{name}.db")
+            db_path = os.path.join(self.data_dir, f"{name}{suffix}.db")
 
         if data_path is None:
             data_path = os.path.join(self.data_dir, f"{name}.jsonl")
 
-        cache_path = os.path.join(self.cache_dir, f"retrieval-{name}.json")
-        embed_cache_path = os.path.join(self.cache_dir, f"retrieval-{name}.pkl")
+        cache_path = os.path.join(self.cache_dir, f"retrieval-{name}{suffix}.json")
+        embed_cache_path = os.path.join(self.cache_dir, f"retrieval-{name}{suffix}.pkl")
 
-        self.db[name] = DocDB(db_path=db_path, data_path=data_path)
-        self.retrieval[name] = Retrieval(self.db[name], cache_path, embed_cache_path, batch_size=self.batch_size)
+        self.db[name] = db_class(db_path=db_path, data_path=data_path)
+        self.retrieval[name] = retrieval_class(self.db[name], cache_path, embed_cache_path, batch_size=self.batch_size)
+
         if "npm" in self.model_name:
-            cache_path = os.path.join(self.cache_dir, f"bm25-{name}.json")
-            embed_cache_path = os.path.join(self.cache_dir, f"bm25-{name}.pkl")
-            self.npm[name] = NPM(Retrieval(self.db[name], cache_path, embed_cache_path, "bm25"),
-                                 "npm-single",
-                                 cache_file=os.path.join(self.cache_dir, f"npm-{name}.pkl"))
-
+            cache_path = os.path.join(self.cache_dir, f"bm25-{name}{suffix}.json")
+            embed_cache_path = os.path.join(self.cache_dir, f"bm25-{name}{suffix}.pkl")
+            self.npm[name] = NPM(
+                retrieval_class(self.db[name], cache_path, embed_cache_path, "bm25"),
+                "npm-single",
+                cache_file=os.path.join(self.cache_dir, f"npm-{name}.pkl")
+            )
 
     def print_cost_estimates(self, total_words, task, model):
         # https://help.openai.com/en/articles/4936856-what-are-tokens-and-how-to-count-them
@@ -125,8 +140,17 @@ class FactScorer(object):
         if atomic_facts is not None:
             assert len(topics)==len(atomic_facts), "`topics` and `atomic_facts` should have the same length"
         else:
+            # Load AtomicFactGenerator
             if self.af_generator is None:
-                self.af_generator = AtomicFactGenerator(key_path=self.openai_key,
+                if self.openai_key is None:
+                    # Use free Google Gemma 7B model (default)
+                    self.af_generator = AtomicFactGenerator(
+                        demon_dir=os.path.join(self.data_dir, "demos"),
+                        cache_file=os.path.join(self.cache_dir, "AFG.pkl")
+                    )
+                else:
+                    # Use InstructGPT if OpenAI key is provided
+                    self.af_generator = AtomicFactGenerator(key_path=self.openai_key,
                                                         demon_dir=os.path.join(self.data_dir, "demos"),
                                                         gpt3_cache_file=os.path.join(self.cache_dir, "InstructGPT.pkl"))
 
@@ -141,7 +165,7 @@ class FactScorer(object):
                 topics = tqdm(topics)
 
             atomic_facts = []
-            for topic, gen in zip(topics, generations):
+            for topic, gen in tqdm(zip(topics, generations), ncols=0, total=len(topics), desc="atomic fact generation"):
                 # optionally, first detect if the response is abstained
                 response_abstained = is_response_abstained(gen, self.abstain_detection_type)
                 if response_abstained:
@@ -177,7 +201,7 @@ class FactScorer(object):
         scores = []
         init_scores = []
         decisions = []
-        for topic, generation, facts in zip(topics, generations, atomic_facts):
+        for topic, generation, facts in tqdm(zip(topics, generations, atomic_facts), ncols=0, total=len(topics), desc="Fact Scoring"):
             if facts is None:
                 decisions.append(None)
             else:
@@ -212,61 +236,108 @@ class FactScorer(object):
         for atom in atomic_facts:
             atom = atom.strip()
             if self.lm:
-                passages = self.retrieval[knowledge_source].get_passages(topic, atom, k=5)
-                definition = "Answer the question about {} based on the given context.\n\n".format(topic)
-                context = ""
-                for psg_idx, psg in enumerate(reversed(passages)):
-                    context += "Title: {}\nText: {}\n\n".format(psg["title"], psg["text"].replace("<s>", "").replace("</s>", ""))
-                definition += context.strip()
-                if not definition[-1] in string.punctuation:
-                    definition += "."
-                prompt = "{}\n\nInput: {} True or False?\nOutput:".format(definition.strip(), atom.strip())
-
-                if cost_estimate:
-                    if cost_estimate == "consider_cache" and (prompt.strip() + "_0") not in self.lm.cache_dict:
-                        total_words += len(prompt.split())
-                    elif cost_estimate == "ignore_cache":
-                        total_words += len(prompt.split())
-                    continue
-
-                output = self.lm.generate(prompt)
-
-                if type(output[1])==np.ndarray:
-                    # when logits are available
-                    logits = np.array(output[1])
-                    assert logits.shape[0] in [32000, 32001]
-                    true_score = logits[5852]
-                    false_score = logits[7700]
-                    is_supported = true_score > false_score
-                else:
-                    # when logits are unavailable
-                    generated_answer = output[0].lower()
-                    if "true" in generated_answer or "false" in generated_answer:
-                        if "true" in generated_answer and "false" not in generated_answer:
-                            is_supported = True
-                        elif "false" in generated_answer and "true" not in generated_answer:
-                            is_supported = False
-                        else:
-                            is_supported = generated_answer.index("true") > generated_answer.index("false")
-                    else:
-                        is_supported = all([keyword not in generated_answer.lower().translate(str.maketrans("", "", string.punctuation)).split() for keyword in ["not", "cannot", "unknown", "information"]])
-
+                decision, total_words = self._get_score_atom_lm(atom, topic, knowledge_source, cost_estimate)
+                is_supported = decision.get("lm", {}).get("is_supported", False)
             else:
                 is_supported = True
+                decision = {}
 
             if is_supported and "npm" in self.model_name:
                 npprob = self.npm[knowledge_source].get_probabilty(topic, atom)
                 is_supported = npprob > 0.3
-
-            decisions.append({"atom": atom, "is_supported": is_supported})
+                decision["npm"] = {
+                    "is_supported": is_supported,
+                    "true_score": npprob,
+                    "false_score": 1-npprob
+                }
+            decision["is_supported"] = is_supported
+            decisions.append(decision)
 
         if cost_estimate:
             return total_words
         else:
             return decisions
 
-if __name__ == '__main__':
+    def _get_score_atom_lm(self, atom, topic, knowledge_source, cost_estimate):
+        total_words = 0
+        decision = {
+            "atom": atom
+        }
+        passages = self.retrieval[knowledge_source].get_passages(topic, atom, k=5)
+        prompts = self._build_lm_prompts(atom, topic, passages)
+        if cost_estimate:
+            for prompt in prompts:
+                if cost_estimate == "consider_cache" and (prompt.strip() + "_0") not in self.lm.cache_dict:
+                    total_words += len(prompt.split())
+                elif cost_estimate == "ignore_cache":
+                    total_words += len(prompt.split())
+            return decision, total_words
 
+        decision["individual"] = []
+        for prompt, psg in zip(prompts, passages):
+            dec = {
+                "prompt": prompt,
+                "passage": psg["text"]
+            }
+            output = self.lm.generate(prompt)
+
+            if type(output[1]) == np.ndarray:
+                # when logits are available
+                logits = np.array(output[1])
+                assert logits.shape[0] in [32000, 32001]
+                true_score = logits[5852]
+                false_score = logits[7700]
+                is_supported = true_score > false_score
+                dec.update({
+                    "true_score": true_score,
+                    "false_score": false_score,
+                    "is_supported": is_supported
+                })
+            else:
+                # when logits are unavailable
+                generated_answer = output[0].lower()
+                if "true" in generated_answer or "false" in generated_answer:
+                    if "true" in generated_answer and "false" not in generated_answer:
+                        is_supported = True
+                    elif "false" in generated_answer and "true" not in generated_answer:
+                        is_supported = False
+                    else:
+                        is_supported = generated_answer.index("true") > generated_answer.index("false")
+                else:
+                    is_supported = all([keyword not in generated_answer.lower().translate(
+                        str.maketrans("", "", string.punctuation)).split() for keyword in
+                                        ["not", "cannot", "unknown", "information"]])
+                dec["is_supported"] = is_supported
+            decision["individual"].append(dec)
+        # Aggregate into final decision
+        decision["lm"] = {"is_supported": np.any([d["is_supported"] for d in decision["individual"]])}
+        return decision, total_words
+
+    def _build_lm_prompts(self, atom, topic, passages):
+        definition = "Answer the question about {} based on the given context.\n\n".format(topic)
+        prompt_template = "{}\n\nInput: {} True or False?\nOutput:"
+        context_template = "Title: {}\nText: {}\n\n"
+        if self.mode == "multi":
+            prompts = []
+            for psg in passages:
+                context = context_template.format(psg["title"],psg["text"].replace("<s>", "").replace("</s>", ""))
+                prompt = f"{definition}{context.strip()}"
+                if not prompt[-1] in string.punctuation:
+                    prompt += "."
+                prompt = prompt_template.format(prompt, atom.strip())
+                prompts.append(prompt)
+        else:
+            context = ""
+            for psg_idx, psg in enumerate(reversed(passages)):
+                context += context_template.format(psg["title"], psg["text"].replace("<s>", "").replace("</s>", ""))
+            definition += context.strip()
+            if not definition[-1] in string.punctuation:
+                definition += "."
+            prompts = [prompt_template.format(definition.strip(), atom.strip())]
+        return prompts
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--input_path',
                         type=str,
@@ -315,7 +386,6 @@ if __name__ == '__main__':
     parser.add_argument('--n_samples',
                         type=int,
                         default=None)
-
     args = parser.parse_args()
 
     logging.basicConfig(format='%(asctime)s - %(name)s - %(message)s',

@@ -13,27 +13,32 @@ import time
 from nltk.tokenize import sent_tokenize
 
 from factscore.openai_lm import OpenAIModel
+from factscore.clm import CLM
 
 nltk.download("punkt")
 
 
-class AtomicFactGenerator(object):
-    def __init__(self, key_path, demon_dir, gpt3_cache_file=None):
+class AtomicFactGeneratorBase(object):
+    """Base AtomicFact Generator"""
+    def __init__(self, demon_dir, is_bio=False):
         self.nlp = spacy.load("en_core_web_sm")
-        self.is_bio = True
+        self.is_bio = is_bio
         self.demon_path = os.path.join(demon_dir, "demons.json" if self.is_bio else "demons_complex.json")
+        self.instructions = "Please breakdown the following sentence into independent facts"
 
-        self.openai_lm = OpenAIModel("InstructGPT", cache_file=gpt3_cache_file, key_path=key_path)
-
-        # get the demos
+        # Get the demos
         with open(self.demon_path, 'r') as f:
             self.demons = json.load(f)
 
         tokenized_corpus = [doc.split(" ") for doc in self.demons.keys()]
         self.bm25 = BM25Okapi(tokenized_corpus)
+        self.lm = None  # Initialize in extended classes
 
     def save_cache(self):
-        self.openai_lm.save_cache()
+        self.lm.save_cache()
+
+    def calculate_cost_estimate(self, text, cost_estimate):
+        return 0
 
     def run(self, generation, cost_estimate=None):
         """Convert the generation into a set of atomic facts. Return a total words cost if cost_estimate != None."""
@@ -45,7 +50,7 @@ class AtomicFactGenerator(object):
         sentences = []
         para_breaks = []
         for para_idx, paragraph in enumerate(paragraphs):
-            if para_idx > 0 :
+            if para_idx > 0:
                 para_breaks.append(len(sentences))
 
             initials = detect_initials(paragraph)
@@ -61,9 +66,12 @@ class AtomicFactGenerator(object):
 
             sentences += curr_sentences
 
-        atoms_or_estimate = self.get_init_atomic_facts_from_sentence([sent for i, sent in enumerate(sentences) if not (not self.is_bio and ( \
-                            (i==0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
-                            (i==len(sentences)-1 and (sent.startswith("Please") or sent.startswith("I hope") or sent.startswith("Here are")))))], cost_estimate=cost_estimate)
+        atoms_or_estimate = self.get_init_atomic_facts_from_sentence(
+            [sent for i, sent in enumerate(sentences) if not (not self.is_bio and ( \
+                        (i == 0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
+                        (i == len(sentences) - 1 and (
+                                    sent.startswith("Please") or sent.startswith("I hope") or sent.startswith(
+                                "Here are")))))], cost_estimate=cost_estimate)
 
         if cost_estimate:
             return atoms_or_estimate
@@ -73,12 +81,14 @@ class AtomicFactGenerator(object):
         atomic_facts_pairs = []
         for i, sent in enumerate(sentences):
             if not self.is_bio and ( \
-                (i==0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
-                (i==len(sentences)-1 and (sent.startswith("Please") or sent.startswith("I hope") or sent.startswith("Here are")))):
+                            (i == 0 and (sent.startswith("Sure") or sent.startswith("Here are"))) or \
+                            (i == len(sentences) - 1 and (
+                                    sent.startswith("Please") or sent.startswith("I hope") or sent.startswith(
+                                "Here are")))):
                 atomic_facts_pairs.append((sent, []))
             elif self.is_bio and sent.startswith("This sentence does not contain any facts"):
                 atomic_facts_pairs.append((sent, []))
-            elif sent.startswith("Sure") or sent.startswith("Please") or (i==0 and sent.startswith("Here are")):
+            elif sent.startswith("Sure") or sent.startswith("Please") or (i == 0 and sent.startswith("Here are")):
                 atomic_facts_pairs.append((sent, []))
             else:
                 atomic_facts_pairs.append((sent, atoms[sent]))
@@ -91,7 +101,6 @@ class AtomicFactGenerator(object):
             atomic_facts_pairs, para_breaks = postprocess_atomic_facts(atomic_facts_pairs, list(para_breaks), self.nlp)
 
         return atomic_facts_pairs, para_breaks
-
 
     def get_init_atomic_facts_from_sentence(self, sentences, cost_estimate=None):
         """Get the initial atomic facts from the sentences. Return a total words cost if cost_estimate != None."""
@@ -112,30 +121,29 @@ class AtomicFactGenerator(object):
             prompt = ""
 
             for i in range(n):
-                prompt = prompt + "Please breakdown the following sentence into independent facts: {}\n".format(list(demons.keys())[i])
+                prompt = prompt + "{}: {}\n".format(self.instructions,
+                    list(demons.keys())[i])
                 for fact in demons[list(demons.keys())[i]]:
                     prompt = prompt + "- {}\n".format(fact)
                 prompt = prompt + "\n"
 
             for match in top_machings:
-                prompt = prompt + "Please breakdown the following sentence into independent facts: {}\n".format(match)
+                prompt = prompt + "{}}: {}\n".format(self.instructions, match)
                 for fact in demons[match]:
                     prompt = prompt + "- {}\n".format(fact)
                 prompt = prompt + "\n"
-            prompt = prompt + "Please breakdown the following sentence into independent facts: {}\n".format(sentence)
+            prompt = prompt + "{}: {}\n".format(self.instructions, sentence)
             prompts.append(prompt)
             prompt_to_sent[prompt] = sentence
 
         if cost_estimate:
             total_words_estimate = 0
             for prompt in prompts:
-                if cost_estimate == "consider_cache" and (prompt.strip() + "_0") in self.openai_lm.cache_dict:
-                    continue
-                total_words_estimate += len(prompt.split())
+                total_words_estimate += self.calculate_cost_estimate(prompt, cost_estimate)
             return total_words_estimate
         else:
             for prompt in prompts:
-                output, _ = self.openai_lm.generate(prompt)
+                output, _ = self.lm.generate(prompt)
                 atoms[prompt_to_sent[prompt]] = text_to_sentences(output)
 
             for key, value in demons.items():
@@ -144,6 +152,29 @@ class AtomicFactGenerator(object):
 
             return atoms
 
+
+class AtomicFactGenerator(AtomicFactGeneratorBase):
+    """AtomicFact Generator for Causal LM models from HuggingFace"""
+    def __init__(self, demon_dir, model_name="google/gemma-7b-it", model_dir=None, cache_file=None):
+        super().__init__(demon_dir)
+        self.lm = CLM(model_name, model_dir=model_dir, cache_file=cache_file)
+
+
+class AtomicFactGeneratorGPT(AtomicFactGeneratorBase):
+    """AtomicFact Generator for OpenAI models"""
+    def __init__(self, key_path, demon_dir, gpt3_cache_file=None):
+        super().__init__(demon_dir)
+        self.lm = OpenAIModel("InstructGPT", cache_file=gpt3_cache_file, key_path=key_path)
+
+    def calculate_cost_estimate(self, text, cost_estimate):
+        if cost_estimate == "consider_cache" and (text.strip() + "_0") in self.lm.cache_dict:
+            return 0
+        return len(text.split())
+
+
+###############
+# Misc
+###############
 
 def best_demos(query, bm25, demons_sents, k):
     tokenized_query = query.split(" ")
@@ -155,9 +186,9 @@ def best_demos(query, bm25, demons_sents, k):
 def text_to_sentences(text):
     sentences = text.split("- ")[1:]
     sentences = [sent.strip()[:-1] if sent.strip()[-1] == '\n' else sent.strip() for sent in sentences]
-    if len(sentences) > 0: 
+    if len(sentences) > 0:
         if sentences[-1][-1] != '.':
-            sentences[-1] = sentences[-1] + '.' 
+            sentences[-1] = sentences[-1] + '.'
     else:
         sentences = []
     return sentences
@@ -165,20 +196,28 @@ def text_to_sentences(text):
 
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
+
     def remove_articles(text):
         regex = re.compile(r'\b(a|an|the)\b', re.UNICODE)
         return re.sub(regex, ' ', text)
+
     def white_space_fix(text):
         return ' '.join(text.split())
+
     def remove_punc(text):
         exclude = set(string.punctuation)
         return ''.join(ch for ch in text if ch not in exclude)
+
     def lower(text):
         return text.lower()
+
     return white_space_fix(remove_articles(remove_punc(lower(s))))
 
-MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+
+MONTHS = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November",
+          "December"]
 MONTHS = [m.lower() for m in MONTHS]
+
 
 def is_num(text):
     try:
@@ -187,12 +226,14 @@ def is_num(text):
     except Exception:
         return False
 
+
 def is_date(text):
     text = normalize_answer(text)
     for token in text.split(" "):
         if (not is_num(token)) and token not in MONTHS:
             return False
     return True
+
 
 def extract_numeric_values(text):
     pattern = r'\b\d+\b'  # regular expression pattern for integers
@@ -211,7 +252,6 @@ def detect_entities(text, nlp):
         else:
             entities.add(text)
 
-
     for ent in doc.ents:
         # spacy often has errors with other types of entities
         if ent.label_ in ["DATE", "TIME", "PERCENT", "MONEY", "QUANTITY", "ORDINAL", "CARDINAL"]:
@@ -222,16 +262,17 @@ def detect_entities(text, nlp):
                 for token in ent.text.split():
                     if is_date(token):
                         _add_to_entities(token)
-        
+
     for new_ent in extract_numeric_values(text):
         if not np.any([new_ent in ent for ent in entities]):
             entities.add(new_ent)
 
     return entities
 
-def postprocess_atomic_facts(_atomic_facts, para_breaks, nlp):
 
-    verbs = ["born.", " appointed.", " characterized.", " described.", " known.", " member.", " advocate.", "served.", "elected."]
+def postprocess_atomic_facts(_atomic_facts, para_breaks, nlp):
+    verbs = ["born.", " appointed.", " characterized.", " described.", " known.", " member.", " advocate.", "served.",
+             "elected."]
     permitted_verbs = ["founding member."]
 
     atomic_facts = []
@@ -240,7 +281,7 @@ def postprocess_atomic_facts(_atomic_facts, para_breaks, nlp):
 
     for i, (sent, facts) in enumerate(_atomic_facts):
         sent = sent.strip()
-        if len(sent.split())==1 and i not in para_breaks and i > 0:
+        if len(sent.split()) == 1 and i not in para_breaks and i > 0:
             assert i not in para_breaks
             atomic_facts[-1][0] += " " + sent
             atomic_facts[-1][1] += facts
@@ -255,7 +296,8 @@ def postprocess_atomic_facts(_atomic_facts, para_breaks, nlp):
         # print (entities)
         new_facts = []
         for i, fact in enumerate(facts):
-            if any([fact.endswith(verb) for verb in verbs]) and not any([fact.endswith(verb) for verb in permitted_verbs]):
+            if any([fact.endswith(verb) for verb in verbs]) and not any(
+                    [fact.endswith(verb) for verb in permitted_verbs]):
                 if any([fact[:-1] in other_fact for j, other_fact in enumerate(facts) if j != i]):
                     continue
             sent_entities = detect_entities(fact, nlp)
@@ -280,13 +322,14 @@ def postprocess_atomic_facts(_atomic_facts, para_breaks, nlp):
                 continue
             new_facts.append(fact)
         try:
-            assert entities==covered_entities
+            assert entities == covered_entities
         except Exception:
-            new_facts = facts # there is a bug in spacy entity linker, so just go with the previous facts
+            new_facts = facts  # there is a bug in spacy entity linker, so just go with the previous facts
 
         new_atomic_facts.append((sent, new_facts))
 
     return new_atomic_facts, new_para_breaks
+
 
 def is_integer(s):
     try:
@@ -295,28 +338,31 @@ def is_integer(s):
     except Exception:
         return False
 
+
 def detect_initials(text):
     pattern = r"[A-Z]\. ?[A-Z]\."
     match = re.findall(pattern, text)
     return [m for m in match]
 
+
 def fix_sentence_splitter(curr_sentences, initials):
     for initial in initials:
         if not np.any([initial in sent for sent in curr_sentences]):
-            alpha1, alpha2 = [t.strip() for t in initial.split(".") if len(t.strip())>0]
+            alpha1, alpha2 = [t.strip() for t in initial.split(".") if len(t.strip()) > 0]
             for i, (sent1, sent2) in enumerate(zip(curr_sentences, curr_sentences[1:])):
                 if sent1.endswith(alpha1 + ".") and sent2.startswith(alpha2 + "."):
                     # merge sentence i and i+1
-                    curr_sentences = curr_sentences[:i] + [curr_sentences[i] + " " + curr_sentences[i+1]] + curr_sentences[i+2:]
+                    curr_sentences = curr_sentences[:i] + [
+                        curr_sentences[i] + " " + curr_sentences[i + 1]] + curr_sentences[i + 2:]
                     break
     sentences = []
     combine_with_previous = None
     for sent_idx, sent in enumerate(curr_sentences):
-        if len(sent.split())<=1 and sent_idx==0:
+        if len(sent.split()) <= 1 and sent_idx == 0:
             assert not combine_with_previous
             combine_with_previous = True
             sentences.append(sent)
-        elif len(sent.split())<=1:
+        elif len(sent.split()) <= 1:
             assert sent_idx > 0
             sentences[-1] += " " + sent
             combined_with_previous = False
@@ -335,11 +381,14 @@ def fix_sentence_splitter(curr_sentences, initials):
 
 
 def main():
-    generator = AtomicFactGenerator("api.key", "demos", gpt3_cache_dir=None)
-    atomic_facts, para_breaks = generator.run("Thierry Henry (born 17 August 1977) is a French professional football coach, pundit, and former player. He is considered one of the greatest strikers of all time, and one the greatest players of the Premier League history. He has been named Arsenal F.C's greatest ever player.\n\nHenry made his professional debut with Monaco in 1994 before signing for defending Serie A champions Juventus. However, limited playing time, coupled with disagreements with the club's hierarchy, led to him signing for Premier League club Arsenal for £11 million in 1999.")
+    # generator = AtomicFactGeneratorGPT("api.key", "demos", gpt3_cache_dir=None)
+    generator = AtomicFactGenerator(".cache/factscore/demos", cache_file=".cache/factscore/af.pkl")
+    atomic_facts, para_breaks = generator.run(
+        "Thierry Henry (born 17 August 1977) is a French professional football coach, pundit, and former player. He is considered one of the greatest strikers of all time, and one the greatest players of the Premier League history. He has been named Arsenal F.C's greatest ever player.\n\nHenry made his professional debut with Monaco in 1994 before signing for defending Serie A champions Juventus. However, limited playing time, coupled with disagreements with the club's hierarchy, led to him signing for Premier League club Arsenal for £11 million in 1999.")
 
     print(atomic_facts)
     print(para_breaks)
+
 
 if __name__ == "__main__":
     main()

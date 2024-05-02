@@ -1,6 +1,7 @@
 import json
 import time
 import os
+from pathlib import Path
 
 import sqlite3
 import numpy as np
@@ -11,14 +12,16 @@ from rank_bm25 import BM25Okapi
 SPECIAL_SEPARATOR = "####SPECIAL####SEPARATOR####"
 MAX_LENGTH = 256
 
+
 class DocDB(object):
     """Sqlite backed document storage.
 
     Implements get_doc_text(doc_id).
     """
-
     def __init__(self, db_path=None, data_path=None):
         self.db_path = db_path
+        # Create path directory
+        os.makedirs(Path(self.db_path).parent, exist_ok=True)
         self.connection = sqlite3.connect(self.db_path, check_same_thread=False)
 
         cursor = self.connection.cursor()
@@ -93,7 +96,7 @@ class DocDB(object):
             print ("Finish saving %dM documents (%dmin)" % (tot / 1000000, (time.time()-start_time)/60))
 
         self.connection.commit()
-        self.connection.close()
+        c.close()
 
     def get_text_from_title(self, title):
         """Fetch the raw text of the doc for 'doc_id'."""
@@ -107,8 +110,44 @@ class DocDB(object):
         assert len(results)>0, f"`topic` in your data ({title}) is likely to be not a valid title in the DB."
         return results
 
-class Retrieval(object):
 
+class DocDBMD(DocDB):
+    def build_db(self, db_path, data_path):
+        titles = set()
+        output_lines = []
+        tot = 0
+        start_time = time.time()
+        c = self.connection.cursor()
+        c.execute("CREATE TABLE documents (title PRIMARY KEY, text);")
+
+        with open(data_path, "r") as f:
+            for line in f:
+                dp = json.loads(line)
+                title = dp["title"]
+                text = dp["text"]
+                if title in titles:
+                    continue
+                titles.add(title)
+                if type(text) == str:
+                    text = [text]
+                text = SPECIAL_SEPARATOR.join(text)
+                output_lines.append((title, text))
+                tot += 1
+
+                if len(output_lines) == 1000000:
+                    c.executemany("INSERT INTO documents VALUES (?,?)", output_lines)
+                    output_lines = []
+                    print("Finish saving %dM documents (%dmin)" % (tot / 1000000, (time.time() - start_time) / 60))
+
+        if len(output_lines) > 0:
+            c.executemany("INSERT INTO documents VALUES (?,?)", output_lines)
+            print("Finish saving %dM documents (%dmin)" % (tot / 1000000, (time.time() - start_time) / 60))
+
+        self.connection.commit()
+        c.close()
+
+
+class Retrieval(object):
     def __init__(self, db, cache_path, embed_cache_path,
                  retrieval_type="gtr-t5-large", batch_size=None):
         self.db = db
@@ -144,6 +183,10 @@ class Retrieval(object):
             self.embed_cache = {}
     
     def save_cache(self):
+        # Create cache directory
+        cache_dir = Path(self.cache_path).parent
+        os.makedirs(cache_dir, exist_ok=True)
+
         if self.add_n > 0:
             if os.path.exists(self.cache_path):
                 with open(self.cache_path, "r") as f:
@@ -202,11 +245,17 @@ class Retrieval(object):
                 self.cache[cache_key] = self.get_gtr_passages(topic, retrieval_query, passages, k)
             assert len(self.cache[cache_key]) in [k, len(passages)]
             self.add_n += 1
-        
-            
+
         return self.cache[cache_key]
 
-        
-        
 
+class RetrievalMD(Retrieval):
+    """
+    A Multi-Document version of the Retrieval class.
 
+    Returns all documents that belong to the specified topic (i.e., document ID)
+    """
+    def get_passages(self, topic, question, k):
+        passages = self.db.get_text_from_title(topic)
+        return passages
+    

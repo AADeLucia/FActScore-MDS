@@ -113,8 +113,8 @@ def recover_instruct_llama(path_raw, output_path, device="cpu", test_recovered_m
 
     return model_recovered, tokenizer_recovered
 
-if __name__ == '__main__':
 
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data_dir',
                         type=str,
@@ -124,8 +124,7 @@ if __name__ == '__main__':
                         default=".cache/factscore")
     parser.add_argument('--llama_7B_HF_path',
                         type=str,
-                        default=None)
-
+                        default="huggyllama/llama-7b")
     args = parser.parse_args()
 
     if not os.path.exists(args.model_dir):
@@ -134,12 +133,14 @@ if __name__ == '__main__':
     if not os.path.exists(args.data_dir):
         os.makedirs(args.data_dir)
 
+    # Model
+    if args.llama_7B_HF_path:
+        recover_instruct_llama(args.llama_7B_HF_path, os.path.join(args.model_dir, "inst-llama-7B"), device="cpu", test_recovered_model=True)
+
+    # Data
     download_file("1IseEAflk1qqV0z64eM60Fs3dTgnbgiyt", "demos.zip", args.data_dir)
     download_file("1enz1PxwxeMr4FRF9dtpCPXaZQCBejuVF", "data.zip", args.data_dir)
     download_file("1mekls6OGOKLmt7gYtHs0WGf5oTamTNat", "enwiki-20230401.db", args.data_dir)
-
-    if args.llama_7B_HF_path:
-        recover_instruct_llama(args.llama_7B_HF_path, os.path.join(args.model_dir, "inst-llama-7B"))
 
     # download the roberta_stopwords.txt file
     subprocess.run(["wget https://raw.githubusercontent.com/shmsw25/FActScore/main/roberta_stopwords.txt"], shell=True)
